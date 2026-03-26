@@ -1,0 +1,28 @@
+menu "CCMS Device Settings"
+
+config DEVICE_IMEI
+    string "Device IMEI (15 digits)"
+    default "123456789012345"
+    help
+        IMEI used as SerialNumber during fleet provisioning and as MQTT client ID.
+
+config CCMS_WIFI_SSID
+    string "Wi-Fi SSID"
+    default "YOUR_WIFI_SSID"
+    help
+        Station-mode SSID used to connect before fleet provisioning.
+
+config CCMS_WIFI_PASSWORD
+    string "Wi-Fi Password"
+    default "YOUR_WIFI_PASSWORD"
+    help
+        Station-mode password used to connect before fleet provisioning.
+
+config CCMS_WIFI_MAX_RETRY
+    int "Wi-Fi max retry count"
+    range 1 100
+    default 20
+    help
+        Maximum reconnection attempts before failing boot.
+
+endmenu
