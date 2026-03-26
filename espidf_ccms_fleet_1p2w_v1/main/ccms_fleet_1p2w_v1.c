@@ -67,6 +67,7 @@ static const char *TAG = "ccms";
 #define MQTT_KEEPALIVE_DEV      60
 #define WIFI_CONNECT_TIMEOUT_MS 60000
 #define TELEMETRY_INTERVAL_MS   (15UL * 60UL * 1000UL)  /* 15 minutes */
+#define FAULT_CHECK_INTERVAL_MS (30UL * 1000UL)          /* 30 seconds  */
 
 #ifndef CONFIG_CCMS_WIFI_SSID
 #define CONFIG_CCMS_WIFI_SSID     "YOUR_WIFI_SSID"
@@ -145,6 +146,7 @@ static char s_thing_name[64];
 static esp_mqtt_client_handle_t s_device_mqtt_client   = NULL;
 static bool                     s_device_mqtt_connected = false;
 static uint64_t                 s_last_telemetry_us     = 0;
+static uint64_t                 s_last_fault_check_us   = 0;
 
 /* Modbus state */
 static bool         s_modbus_online          = false;
@@ -254,6 +256,18 @@ static float clamp_non_negative(float v) { return v < 0.0f ? 0.0f : v; }
 
 /* Round to 2 decimal places — avoids IEEE-754 noise in JSON (e.g. 246.8000030...) */
 static float round2(float v) { return roundf(v * 100.0f) / 100.0f; }
+
+/*
+ * add_num_2dp — add a JSON number formatted to exactly 2 decimal places.
+ * Using cJSON_AddRawToObject + snprintf("%.2f") avoids IEEE-754 float noise
+ * that persists even after round2() (e.g. 246.8f → 246.8000030517578 in JSON).
+ */
+static void add_num_2dp(cJSON *obj, const char *key, float v)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f", (double)v);
+    cJSON_AddRawToObject(obj, key, buf);
+}
 
 /* ========================================================================== */
 /* NVS helpers                                                                */
@@ -414,8 +428,14 @@ static uint16_t mb_crc16(const uint8_t *buf, int len)
  * derived from `reg_3xxxx` (addr = reg_3xxxx - 30001).
  *
  * Uses FC=0x04 (Read Input Registers) as required by the 1P2W meter.
- * Sliding-window frame search to tolerate echo bytes or leading garbage.
- * 500 ms receive window — sufficient for 9600 baud response latency.
+ * Sliding-window frame search to tolerate echo bytes.
+ *
+ * Key timing choices (matched to Arduino reference):
+ *   TX settle : 150 ms — Arduino uses 120 ms after flush; 150 ms is safe margin
+ *   RX window : 300 ms — response arrives within 50 ms at 9600 baud; 300 ms
+ *                        avoids accumulating RS485 line noise into the buffer
+ *   Early exit: stop collecting once we have (frame + echo) bytes to avoid
+ *               the 64-byte buffer filling with noise and hiding the response
  */
 static bool mb_read_raw_try(uint16_t reg_3xxxx, uint16_t words,
                             uint8_t *out, size_t out_sz)
@@ -440,18 +460,26 @@ static bool mb_read_raw_try(uint16_t reg_3xxxx, uint16_t words,
     uart_wait_tx_done(RS485_UART_NUM, pdMS_TO_TICKS(200));
     gpio_set_level(RS485_EN_PIN, 0);
 
-    /* 250 ms settle — matches Arduino behaviour */
-    vTaskDelay(pdMS_TO_TICKS(250));
+    /* 150 ms settle — matches Arduino reference (120 ms) with small margin */
+    vTaskDelay(pdMS_TO_TICKS(150));
 
-    /* --- RX: collect bytes for up to 500 ms total --- */
+    /* --- RX: collect bytes for up to 300 ms ---
+     * Stop early once we have enough bytes to contain the full response
+     * (5 + words*2 bytes) plus the 8-byte echo that some transceivers add.
+     * This prevents RS485 line noise from filling the buffer and obscuring
+     * the valid frame that follows. */
     uint8_t buf[64];
     int     got = 0;
-    uint64_t deadline = esp_timer_get_time() + 500000ULL;
+    int     min_needed = 5 + (words * 2) + 8; /* frame + echo headroom */
+    uint64_t deadline = esp_timer_get_time() + 300000ULL;
 
     while (got < (int)sizeof(buf) && esp_timer_get_time() < deadline) {
         int n = uart_read_bytes(RS485_UART_NUM, buf + got,
                                 (int)sizeof(buf) - got, pdMS_TO_TICKS(20));
-        if (n > 0) got += n;
+        if (n > 0) {
+            got += n;
+            if (got >= min_needed) break; /* have enough — stop collecting */
+        }
     }
 
     if (got <= 0) {
@@ -492,30 +520,40 @@ static bool mb_read_raw_try(uint16_t reg_3xxxx, uint16_t words,
  * mb_read_reg1()
  * --------------
  * Reads one 16-bit input register and returns (raw × scale).
- * Register value is big-endian: bytes [hi][lo].
+ * Retries once after 150 ms if the first attempt fails (handles transient
+ * RS485 line noise that would otherwise leave V=0 for an entire 15-min cycle).
  */
 static float mb_read_reg1(uint16_t reg_3xxxx, float scale)
 {
-    uint8_t data[2] = {0};
-    if (!mb_read_raw_try(reg_3xxxx, 1, data, sizeof(data))) return -1.0f;
-    uint16_t raw = ((uint16_t)data[0] << 8) | data[1];
-    return (float)raw * scale;
+    uint8_t data[2];
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(150)); /* retry gap */
+        memset(data, 0, sizeof(data));
+        if (!mb_read_raw_try(reg_3xxxx, 1, data, sizeof(data))) continue;
+        uint16_t raw = ((uint16_t)data[0] << 8) | data[1];
+        return (float)raw * scale;
+    }
+    return -1.0f;
 }
 
 /*
  * mb_read_reg2()
  * --------------
- * Reads two consecutive 16-bit input registers as a big-endian uint32
- * and returns (raw × scale).
- * Byte order from meter: [b3][b2][b1][b0] → raw = b3<<24|b2<<16|b1<<8|b0
+ * Reads two consecutive 16-bit input registers as a big-endian uint32.
+ * Same retry policy as mb_read_reg1().
  */
 static float mb_read_reg2(uint16_t reg_3xxxx, float scale)
 {
-    uint8_t data[4] = {0};
-    if (!mb_read_raw_try(reg_3xxxx, 2, data, sizeof(data))) return -1.0f;
-    uint32_t raw = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
-                   ((uint32_t)data[2] <<  8) |  (uint32_t)data[3];
-    return (float)raw * scale;
+    uint8_t data[4];
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(150)); /* retry gap */
+        memset(data, 0, sizeof(data));
+        if (!mb_read_raw_try(reg_3xxxx, 2, data, sizeof(data))) continue;
+        uint32_t raw = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                       ((uint32_t)data[2] <<  8) |  (uint32_t)data[3];
+        return (float)raw * scale;
+    }
+    return -1.0f;
 }
 
 static void modbus_detect_if_needed(void)
@@ -804,6 +842,20 @@ static void check_and_publish_faults(float rv, float ri)
 #undef CHK
 }
 
+/*
+ * run_fault_check — lightweight poll called every FAULT_CHECK_INTERVAL_MS.
+ * Reads only voltage + current, updates power-fail logic, and publishes any
+ * fault state change immediately — without waiting for the 15-min telemetry.
+ */
+static void run_fault_check(void)
+{
+    if (!s_modbus_online) return;
+    float rv = clamp_non_negative(mb_read_reg1(REG_VOLTAGE, 0.1f));
+    float ri = clamp_non_negative(mb_read_reg1(REG_CURRENT, 0.01f));
+    update_power_failure_logic(rv);
+    check_and_publish_faults(rv, ri);
+}
+
 /* Build a bitmask of currently active faults for the telemetry fault_code field */
 static int build_fault_code(void)
 {
@@ -852,6 +904,8 @@ static void publish_telemetry_now(void)
     /* --- Power failure & fault logic --- */
     update_power_failure_logic(rv);
     check_and_publish_faults(rv, ri);
+    /* Reset fault-check timer so we don't immediately re-poll after telemetry */
+    s_last_fault_check_us = esp_timer_get_time();
 
     /* --- Build payload --- */
     char topic[64], ts[32] = {0}, sr[8] = {0}, ss_s[8] = {0};
@@ -875,39 +929,40 @@ static void publish_telemetry_now(void)
     cJSON_AddStringToObject(root, "sun_rise_time",  sr);
     cJSON_AddNumberToObject(root, "no_lights_on",   0);
 
-    /* Overall */
-    cJSON_AddNumberToObject(root, "voltage_v",  round2(rv));
-    cJSON_AddNumberToObject(root, "current_a",  round2(ri));
-    cJSON_AddNumberToObject(root, "frequency",  round2(freq));
-    cJSON_AddNumberToObject(root, "pf",         round2(apf));
-    cJSON_AddNumberToObject(root, "kw",         round2(tkw));
-    cJSON_AddNumberToObject(root, "kwh",        round2(kwh));
-    cJSON_AddNumberToObject(root, "kva",        round2(tkva));
-    cJSON_AddNumberToObject(root, "kvah",       round2(kvah));
+    /* Overall — add_num_2dp emits exactly 2 decimal places, eliminating
+     * IEEE-754 noise that round2() alone cannot fix in cJSON serialisation */
+    add_num_2dp(root, "voltage_v",  rv);
+    add_num_2dp(root, "current_a",  ri);
+    add_num_2dp(root, "frequency",  freq);
+    add_num_2dp(root, "pf",         apf);
+    add_num_2dp(root, "kw",         tkw);
+    add_num_2dp(root, "kwh",        kwh);
+    add_num_2dp(root, "kva",        tkva);
+    add_num_2dp(root, "kvah",       kvah);
 
     /* R-phase (= single-phase readings) */
-    cJSON_AddNumberToObject(root, "r_voltage",   round2(rv));
-    cJSON_AddNumberToObject(root, "r_current",   round2(ri));
-    cJSON_AddNumberToObject(root, "r_frequency", round2(freq));
-    cJSON_AddNumberToObject(root, "r_pf",        round2(rpf));
-    cJSON_AddNumberToObject(root, "r_kw",        round2(rkw));
-    cJSON_AddNumberToObject(root, "r_kva",       round2(rkva));
+    add_num_2dp(root, "r_voltage",   rv);
+    add_num_2dp(root, "r_current",   ri);
+    add_num_2dp(root, "r_frequency", freq);
+    add_num_2dp(root, "r_pf",        rpf);
+    add_num_2dp(root, "r_kw",        rkw);
+    add_num_2dp(root, "r_kva",       rkva);
 
     /* Y-phase — always 0 (no Y phase on single-phase meter) */
-    cJSON_AddNumberToObject(root, "y_voltage",   yv);
-    cJSON_AddNumberToObject(root, "y_current",   yi);
-    cJSON_AddNumberToObject(root, "y_frequency", yfreq);
-    cJSON_AddNumberToObject(root, "y_pf",        ypf);
-    cJSON_AddNumberToObject(root, "y_kw",        ykw);
-    cJSON_AddNumberToObject(root, "y_kva",       ykva);
+    add_num_2dp(root, "y_voltage",   yv);
+    add_num_2dp(root, "y_current",   yi);
+    add_num_2dp(root, "y_frequency", yfreq);
+    add_num_2dp(root, "y_pf",        ypf);
+    add_num_2dp(root, "y_kw",        ykw);
+    add_num_2dp(root, "y_kva",       ykva);
 
     /* B-phase — always 0 (no B phase on single-phase meter) */
-    cJSON_AddNumberToObject(root, "b_voltage",   bv);
-    cJSON_AddNumberToObject(root, "b_current",   bi);
-    cJSON_AddNumberToObject(root, "b_frequency", bfreq);
-    cJSON_AddNumberToObject(root, "b_pf",        bpf);
-    cJSON_AddNumberToObject(root, "b_kw",        bkw);
-    cJSON_AddNumberToObject(root, "b_kva",       bkva);
+    add_num_2dp(root, "b_voltage",   bv);
+    add_num_2dp(root, "b_current",   bi);
+    add_num_2dp(root, "b_frequency", bfreq);
+    add_num_2dp(root, "b_pf",        bpf);
+    add_num_2dp(root, "b_kw",        bkw);
+    add_num_2dp(root, "b_kva",       bkva);
 
     /* Debug fields */
     cJSON_AddBoolToObject  (root, "modbus_online",   s_modbus_online);
@@ -1313,11 +1368,23 @@ void app_main(void)
             modbus_detect_if_needed();
         }
 
+        /* Full telemetry every 15 minutes */
         if (s_last_telemetry_us == 0 ||
             (now - s_last_telemetry_us) >= (TELEMETRY_INTERVAL_MS * 1000ULL)) {
             publish_telemetry_now();
             s_last_telemetry_us = now;
         }
+
+        /* Fault-only check every 30 seconds (between telemetry cycles) so alarms
+         * are published immediately on state change, not delayed by 15 minutes */
+        if (now >= s_modbus_start_after_us && s_modbus_online &&
+            s_device_mqtt_connected &&
+            (s_last_fault_check_us == 0 ||
+             (now - s_last_fault_check_us) >= (FAULT_CHECK_INTERVAL_MS * 1000ULL))) {
+            run_fault_check();
+            s_last_fault_check_us = now;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
