@@ -252,6 +252,9 @@ static void safe_copy(char *dst, size_t sz, const char *src)
 
 static float clamp_non_negative(float v) { return v < 0.0f ? 0.0f : v; }
 
+/* Round to 2 decimal places — avoids IEEE-754 noise in JSON (e.g. 246.8000030...) */
+static float round2(float v) { return roundf(v * 100.0f) / 100.0f; }
+
 /* ========================================================================== */
 /* NVS helpers                                                                */
 /* ========================================================================== */
@@ -801,6 +804,16 @@ static void check_and_publish_faults(float rv, float ri)
 #undef CHK
 }
 
+/* Build a bitmask of currently active faults for the telemetry fault_code field */
+static int build_fault_code(void)
+{
+    int code = 0;
+    for (int i = 0; i < FIDX_MAX; i++) {
+        if (s_fault[i].active) code |= (1 << i);
+    }
+    return code;
+}
+
 /* ========================================================================== */
 /* Telemetry                                                                  */
 /* ========================================================================== */
@@ -851,9 +864,9 @@ static void publish_telemetry_now(void)
     cJSON_AddStringToObject(root, "device_id",     s_imei);
     cJSON_AddStringToObject(root, "time",           ts);
     cJSON_AddBoolToObject  (root, "on_off",         s_relay_on);
-    cJSON_AddNumberToObject(root, "fault_code",     0);
-    cJSON_AddNumberToObject(root, "latt",           s_gps.loc_valid ? s_gps.lat : 0.0);
-    cJSON_AddNumberToObject(root, "long",           s_gps.loc_valid ? s_gps.lon : 0.0);
+    cJSON_AddNumberToObject(root, "fault_code",     build_fault_code());
+    cJSON_AddNumberToObject(root, "latt",           s_gps.loc_valid ? round2((float)s_gps.lat) : 0.0);
+    cJSON_AddNumberToObject(root, "long",           s_gps.loc_valid ? round2((float)s_gps.lon) : 0.0);
     cJSON_AddStringToObject(root, "box_no",         "");
     cJSON_AddStringToObject(root, "nsl",            "0");
     cJSON_AddStringToObject(root, "nwsl",           "0");
@@ -863,22 +876,22 @@ static void publish_telemetry_now(void)
     cJSON_AddNumberToObject(root, "no_lights_on",   0);
 
     /* Overall */
-    cJSON_AddNumberToObject(root, "voltage_v",  rv);
-    cJSON_AddNumberToObject(root, "current_a",  ri);
-    cJSON_AddNumberToObject(root, "frequency",  freq);
-    cJSON_AddNumberToObject(root, "pf",         apf);
-    cJSON_AddNumberToObject(root, "kw",         tkw);
-    cJSON_AddNumberToObject(root, "kwh",        kwh);
-    cJSON_AddNumberToObject(root, "kva",        tkva);
-    cJSON_AddNumberToObject(root, "kvah",       kvah);
+    cJSON_AddNumberToObject(root, "voltage_v",  round2(rv));
+    cJSON_AddNumberToObject(root, "current_a",  round2(ri));
+    cJSON_AddNumberToObject(root, "frequency",  round2(freq));
+    cJSON_AddNumberToObject(root, "pf",         round2(apf));
+    cJSON_AddNumberToObject(root, "kw",         round2(tkw));
+    cJSON_AddNumberToObject(root, "kwh",        round2(kwh));
+    cJSON_AddNumberToObject(root, "kva",        round2(tkva));
+    cJSON_AddNumberToObject(root, "kvah",       round2(kvah));
 
     /* R-phase (= single-phase readings) */
-    cJSON_AddNumberToObject(root, "r_voltage",   rv);
-    cJSON_AddNumberToObject(root, "r_current",   ri);
-    cJSON_AddNumberToObject(root, "r_frequency", freq);
-    cJSON_AddNumberToObject(root, "r_pf",        rpf);
-    cJSON_AddNumberToObject(root, "r_kw",        rkw);
-    cJSON_AddNumberToObject(root, "r_kva",       rkva);
+    cJSON_AddNumberToObject(root, "r_voltage",   round2(rv));
+    cJSON_AddNumberToObject(root, "r_current",   round2(ri));
+    cJSON_AddNumberToObject(root, "r_frequency", round2(freq));
+    cJSON_AddNumberToObject(root, "r_pf",        round2(rpf));
+    cJSON_AddNumberToObject(root, "r_kw",        round2(rkw));
+    cJSON_AddNumberToObject(root, "r_kva",       round2(rkva));
 
     /* Y-phase — always 0 (no Y phase on single-phase meter) */
     cJSON_AddNumberToObject(root, "y_voltage",   yv);
