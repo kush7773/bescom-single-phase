@@ -66,8 +66,8 @@ static const char *TAG = "ccms";
 #define MQTT_KEEPALIVE_PROV     30
 #define MQTT_KEEPALIVE_DEV      60
 #define WIFI_CONNECT_TIMEOUT_MS 60000
-#define TELEMETRY_INTERVAL_MS   (15UL * 60UL * 1000UL)  /* 15 minutes */
-#define FAULT_CHECK_INTERVAL_MS (30UL * 1000UL)          /* 30 seconds  */
+#define TELEMETRY_INTERVAL_MS   (15UL * 60UL * 1000UL)  /* 15 min (fallback when no GPS time) */
+#define FAULT_CHECK_INTERVAL_MS  (5UL * 1000UL)          /* 5 seconds — near-immediate fault detect */
 
 #ifndef CONFIG_CCMS_WIFI_SSID
 #define CONFIG_CCMS_WIFI_SSID     "YOUR_WIFI_SSID"
@@ -148,6 +148,15 @@ static bool                     s_device_mqtt_connected = false;
 static uint64_t                 s_last_telemetry_us     = 0;
 static uint64_t                 s_last_fault_check_us   = 0;
 
+/* Clock-aligned telemetry: last IST 15-min slot published (0-95, -1=never) */
+static int  s_last_published_slot  = -1;
+
+/* GPS lock transition: triggers immediate telemetry upload */
+static bool s_gps_was_locked       = false;
+
+/* Initial publish: deferred until modbus has stabilized after boot */
+static bool s_initial_publish_due  = false;
+
 /* Modbus state */
 static bool         s_modbus_online          = false;
 static uint64_t     s_last_modbus_detect_us  = 0;
@@ -215,12 +224,13 @@ static mqtt_chunk_accumulator_t s_acc = {0};
 
 /* Fault indices — single-phase */
 typedef enum {
-    FIDX_ROV = 0,
-    FIDX_RUV,
-    FIDX_OL,
-    FIDX_ROL,
-    FIDX_RPNl,
-    FIDX_ACPFl,
+    FIDX_ROV = 0,   /* Over Voltage              */
+    FIDX_RUV,       /* Under Voltage             */
+    FIDX_OL,        /* Over Load (total)         */
+    FIDX_ROL,       /* Phase Over Load           */
+    FIDX_RPNl,      /* No Load (all lights off)  */
+    FIDX_ACPFl,     /* AC Power Fail             */
+    FIDX_LFL,       /* Lamp Fault Low — fewer lamps ON than NWSL */
     FIDX_MAX
 } fault_idx_t;
 
@@ -267,6 +277,51 @@ static void add_num_2dp(cJSON *obj, const char *key, float v)
     char buf[32];
     snprintf(buf, sizeof(buf), "%.2f", (double)v);
     cJSON_AddRawToObject(obj, key, buf);
+}
+
+/* add_num_6dp — 6 decimal places for GPS coordinates */
+static void add_num_6dp(cJSON *obj, const char *key, double v)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.6f", v);
+    cJSON_AddRawToObject(obj, key, buf);
+}
+
+/*
+ * get_ist_15min_slot()
+ * Returns the current IST 15-minute slot index (0–95).
+ *   slot 0  = 00:00–00:14 IST
+ *   slot 57 = 14:15–14:29 IST
+ *   slot 95 = 23:45–23:59 IST
+ * Returns -1 if wall-clock time has not yet been synced (year < 2020).
+ */
+static int get_ist_15min_slot(void)
+{
+    time_t t = time(NULL);
+    if (t < 1577836800LL) return -1;     /* pre-2020 → time not synced */
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    int ist_min = (tm.tm_hour * 60 + tm.tm_min + 330) % 1440; /* UTC+5:30 */
+    return ist_min / 15;                 /* 0–95                        */
+}
+
+/*
+ * telemetry_due()
+ * Returns true when a 15-minute telemetry publish should fire:
+ *   • If GPS time is available: fires once per IST 15-min slot (:00,:15,:30,:45)
+ *   • If time not yet synced:   falls back to 15-min interval timer from boot
+ */
+static bool telemetry_due(void)
+{
+    int slot = get_ist_15min_slot();
+    if (slot < 0) {
+        /* No time sync — use elapsed-time fallback */
+        uint64_t now = esp_timer_get_time();
+        return (s_last_telemetry_us == 0 ||
+                (now - s_last_telemetry_us) >= (TELEMETRY_INTERVAL_MS * 1000ULL));
+    }
+    /* Fire once per slot; slot index changes every 15 minutes */
+    return (slot != s_last_published_slot);
 }
 
 /* ========================================================================== */
@@ -815,12 +870,14 @@ static void publish_fault(const char *code, bool active)
 
 /*
  * Single-phase fault checks:
- *   ROV  — over voltage  (V > 270)
- *   RUV  — under voltage (0 < V < 170)
- *   OL   — over load     (I > 18 A)
- *   ROL  — phase over load (same threshold for single phase)
- *   RPNl — no load       (relay on, V present, I ≈ 0)
- *   ACPFl— AC power fail (battery mode active)
+ *   ROV  — over voltage        (V > 270)
+ *   RUV  — under voltage       (0 < V < 170)
+ *   OL   — over load (total)   (I > 18 A)
+ *   ROL  — phase over load     (I > 18 A)
+ *   RPNl — no load             (relay on, V present, I ≈ 0 → all lights off)
+ *   ACPFl— AC power fail       (battery mode active)
+ *   LFL  — lamp fault low      (relay on, V present, lights ON < NWSL)
+ *           requires CONFIG_CCMS_NWSL > 0 and CONFIG_CCMS_LAMP_CURRENT_MA > 0
  */
 static void check_and_publish_faults(float rv, float ri)
 {
@@ -836,8 +893,24 @@ static void check_and_publish_faults(float rv, float ri)
     CHK(FIDX_RUV,   "RUV",   rv > 0 && rv < FAULT_UV_THRESH);
     CHK(FIDX_OL,    "OL",    ri > FAULT_OL_THRESH);
     CHK(FIDX_ROL,   "ROL",   ri > FAULT_OL_THRESH);
-    CHK(FIDX_RPNl,  "RPNl",  s_relay_on && rv > 50 && ri < 0.1f);
+    CHK(FIDX_RPNl,  "RPNl",  s_relay_on && rv > 50.0f && ri < 0.1f);
     CHK(FIDX_ACPFl, "ACPFl", s_is_battery_mode);
+
+    /* LFL — Lamp Fault Low: relay closed, voltage present, but
+     * measured current implies fewer lamps than NWSL are working.
+     * Only evaluated when NWSL and lamp current are configured. */
+    {
+        int nwsl    = CONFIG_CCMS_NWSL;
+        int lamp_ma = CONFIG_CCMS_LAMP_CURRENT_MA;
+        int lights_on = 0;
+        if (nwsl > 0 && lamp_ma > 0 && ri > 0.0f) {
+            lights_on = (int)(ri / (lamp_ma / 1000.0f) + 0.5f);
+            if (lights_on > nwsl) lights_on = nwsl;
+        }
+        CHK(FIDX_LFL, "LFL",
+            nwsl > 0 && lamp_ma > 0 &&
+            s_relay_on && rv > 50.0f && ri >= 0.1f && lights_on < nwsl);
+    }
 
 #undef CHK
 }
@@ -901,6 +974,16 @@ static void publish_telemetry_now(void)
     float tkva = rkva;
     float apf  = rpf;
 
+    /* --- Lamp count from current + NWSL config --- */
+    int nsl_cfg  = CONFIG_CCMS_NSL;
+    int nwsl_cfg = CONFIG_CCMS_NWSL;
+    int lamp_ma  = CONFIG_CCMS_LAMP_CURRENT_MA;
+    int num_lights_on = 0;
+    if (nwsl_cfg > 0 && lamp_ma > 0 && ri > 0.0f) {
+        num_lights_on = (int)(ri / (lamp_ma / 1000.0f) + 0.5f);
+        if (num_lights_on > nwsl_cfg) num_lights_on = nwsl_cfg;
+    }
+
     /* --- Power failure & fault logic --- */
     update_power_failure_logic(rv);
     check_and_publish_faults(rv, ri);
@@ -919,15 +1002,15 @@ static void publish_telemetry_now(void)
     cJSON_AddStringToObject(root, "time",           ts);
     cJSON_AddBoolToObject  (root, "on_off",         s_relay_on);
     cJSON_AddNumberToObject(root, "fault_code",     build_fault_code());
-    cJSON_AddNumberToObject(root, "latt",           s_gps.loc_valid ? round2((float)s_gps.lat) : 0.0);
-    cJSON_AddNumberToObject(root, "long",           s_gps.loc_valid ? round2((float)s_gps.lon) : 0.0);
+    add_num_6dp            (root, "latt",           s_gps.loc_valid ? s_gps.lat : 0.0);
+    add_num_6dp            (root, "long",           s_gps.loc_valid ? s_gps.lon : 0.0);
     cJSON_AddStringToObject(root, "box_no",         "");
-    cJSON_AddStringToObject(root, "nsl",            "0");
-    cJSON_AddStringToObject(root, "nwsl",           "0");
+    cJSON_AddNumberToObject(root, "nsl",            nsl_cfg);
+    cJSON_AddNumberToObject(root, "nwsl",           nwsl_cfg);
     cJSON_AddStringToObject(root, "mode",           "Auto(A)");
     cJSON_AddStringToObject(root, "sun_set_time",   ss_s);
     cJSON_AddStringToObject(root, "sun_rise_time",  sr);
-    cJSON_AddNumberToObject(root, "no_lights_on",   0);
+    cJSON_AddNumberToObject(root, "no_lights_on",   num_lights_on);
 
     /* Overall — add_num_2dp emits exactly 2 decimal places, eliminating
      * IEEE-754 noise that round2() alone cannot fix in cJSON serialisation */
@@ -972,13 +1055,19 @@ static void publish_telemetry_now(void)
     char *payload = cJSON_PrintUnformatted(root);
     if (payload) {
         int mid = esp_mqtt_client_publish(s_device_mqtt_client, topic, payload, 0, 1, 0);
-        ESP_LOGI(TAG, "Telemetry published mid=%d | V=%.1f I=%.2f kW=%.3f"
-                 " kWh=%.1f kVA=%.3f PF=%.2f freq=%.1f modbus=%s",
-                 mid, rv, ri, rkw, kwh, rkva, rpf, freq,
+        ESP_LOGI(TAG, "Telemetry published mid=%d | V=%.2f I=%.2f kW=%.2f"
+                 " kWh=%.2f kVA=%.2f PF=%.2f freq=%.2f lights=%d modbus=%s",
+                 mid, rv, ri, rkw, kwh, rkva, rpf, freq, num_lights_on,
                  s_modbus_online ? "OK" : "NO");
         free(payload);
     }
     cJSON_Delete(root);
+
+    /* Update timing state so every caller (MQTT connect, relay, GPS lock, main loop)
+     * keeps the clock-aligned slot tracker consistent */
+    s_last_telemetry_us = esp_timer_get_time();
+    int _slot = get_ist_15min_slot();
+    if (_slot >= 0) s_last_published_slot = _slot;
 }
 
 /* ========================================================================== */
@@ -1023,7 +1112,9 @@ static void mqtt_device_handler(void *arg, esp_event_base_t base,
         s_device_mqtt_connected = true;
         ESP_LOGI(TAG, "Device MQTT connected");
         subscribe_device_topics(ev->client);
-        publish_telemetry_now();
+        /* Initial publish is deferred to the main loop so it fires only
+         * after modbus has stabilised (req 3). Flag set here, main loop fires. */
+        s_initial_publish_due = true;
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -1364,19 +1455,52 @@ void app_main(void)
         gps_solar_update();
 
         uint64_t now = esp_timer_get_time();
+
+        /* Modbus warm-up + periodic detection */
         if (now >= s_modbus_start_after_us) {
             modbus_detect_if_needed();
         }
 
-        /* Full telemetry every 15 minutes */
-        if (s_last_telemetry_us == 0 ||
-            (now - s_last_telemetry_us) >= (TELEMETRY_INTERVAL_MS * 1000ULL)) {
+        /* ------------------------------------------------------------------ */
+        /* REQ 3 — Initial publish after modbus stabilises on boot.            */
+        /* Fires once: when modbus comes online after the 5 s warm-up, or      */
+        /* after a 2-min safety timeout so the server always gets an update.   */
+        /* ------------------------------------------------------------------ */
+        if (s_initial_publish_due && s_device_mqtt_connected &&
+            now >= s_modbus_start_after_us &&
+            (s_modbus_online ||
+             now >= s_modbus_start_after_us + 120000000ULL /* 2 min fallback */)) {
+            ESP_LOGI(TAG, "Initial publish after boot stabilisation");
             publish_telemetry_now();
-            s_last_telemetry_us = now;
+            s_initial_publish_due = false;
         }
 
-        /* Fault-only check every 30 seconds (between telemetry cycles) so alarms
-         * are published immediately on state change, not delayed by 15 minutes */
+        /* ------------------------------------------------------------------ */
+        /* REQ 4 — GPS coordinates locked: publish once immediately.           */
+        /* GPS module is polled every loop second via gps_solar_update().      */
+        /* The moment s_gps_locked_once flips true, upload the confirmed fix.  */
+        /* ------------------------------------------------------------------ */
+        if (s_gps_locked_once && !s_gps_was_locked) {
+            s_gps_was_locked = true;
+            if (s_device_mqtt_connected && !s_initial_publish_due) {
+                ESP_LOGI(TAG, "GPS fix acquired — uploading coordinates");
+                publish_telemetry_now();
+            }
+        }
+
+        /* ------------------------------------------------------------------ */
+        /* REQ 2 — Clock-aligned 15-min telemetry (IST :00,:15,:30,:45).       */
+        /* Falls back to 15-min interval if GPS time has not yet synced.       */
+        /* Skipped while initial publish is still pending to avoid a duplicate.*/
+        /* ------------------------------------------------------------------ */
+        if (!s_initial_publish_due && s_device_mqtt_connected && telemetry_due()) {
+            publish_telemetry_now();
+        }
+
+        /* ------------------------------------------------------------------ */
+        /* REQ 1 — Fault check every 5 s for near-immediate fault reporting.  */
+        /* Reads V+I from modbus, evaluates all fault conditions including LFL.*/
+        /* ------------------------------------------------------------------ */
         if (now >= s_modbus_start_after_us && s_modbus_online &&
             s_device_mqtt_connected &&
             (s_last_fault_check_us == 0 ||
