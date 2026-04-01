@@ -819,6 +819,21 @@ static void gps_solar_update(void)
 }
 
 /* ========================================================================== */
+/* Auto relay — ON at sunset, OFF at sunrise                                 */
+/* ========================================================================== */
+static bool is_night_time(void)
+{
+    if (!s_solar_valid) return false;
+    time_t now = time(NULL);
+    if (now < 1000000LL) return false;   /* clock not yet synced via GPS */
+    struct tm t = {0};
+    gmtime_r(&now, &t);
+    int ist_min = (t.tm_hour * 60 + t.tm_min + (IST_GMT_OFFSET_SEC / 60)) % 1440;
+    /* Night = from sunset until sunrise (spans midnight) */
+    return (ist_min >= s_sunset_min || ist_min < s_sunrise_min);
+}
+
+/* ========================================================================== */
 /* Power-failure logic — single phase (only R/line voltage checked)          */
 /* ========================================================================== */
 static void update_power_failure_logic(float rv)
@@ -1495,6 +1510,24 @@ void app_main(void)
         /* ------------------------------------------------------------------ */
         if (!s_initial_publish_due && s_device_mqtt_connected && telemetry_due()) {
             publish_telemetry_now();
+        }
+
+        /* ------------------------------------------------------------------ */
+        /* Auto relay — sunset → ON, sunrise → OFF                            */
+        /* Only fires when GPS solar data is valid and clock is synced.        */
+        /* s_relay_on prevents re-triggering every loop second.               */
+        /* ------------------------------------------------------------------ */
+        if (s_solar_valid && s_device_mqtt_connected) {
+            bool night = is_night_time();
+            if (night && !s_relay_on) {
+                ESP_LOGI(TAG, "Auto: sunset → relay ON");
+                relay_on();
+                publish_telemetry_now();
+            } else if (!night && s_relay_on) {
+                ESP_LOGI(TAG, "Auto: sunrise → relay OFF");
+                relay_off();
+                publish_telemetry_now();
+            }
         }
 
         /* ------------------------------------------------------------------ */
