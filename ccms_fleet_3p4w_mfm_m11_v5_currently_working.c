@@ -63,7 +63,10 @@
 #include "cJSON.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
-#include "esp_rom_sys.h" /* esp_rom_delay_us() */
+#include "esp_http_client.h" /* esp_http_client_config_t */
+#include "esp_https_ota.h"   /* esp_https_ota() */
+#include "esp_ota_ops.h"     /* esp_ota_get_app_description() */
+#include "esp_rom_sys.h"   /* esp_rom_delay_us() */
 #include "mqtt_client.h"
 #include "soc/uart_reg.h" /* direct UART register access for diagnostics */
 
@@ -98,6 +101,22 @@ static SemaphoreHandle_t s_modbus_mutex = NULL;
 #endif
 #ifndef CONFIG_CCMS_WIFI_MAX_RETRY
 #define CONFIG_CCMS_WIFI_MAX_RETRY 20
+#endif
+
+/* Street-light count config */
+#ifndef CONFIG_CCMS_NSL
+#define CONFIG_CCMS_NSL 0
+#endif
+#ifndef CONFIG_CCMS_NWSL
+#define CONFIG_CCMS_NWSL 0
+#endif
+#ifndef CONFIG_CCMS_LAMP_CURRENT_MA
+#define CONFIG_CCMS_LAMP_CURRENT_MA 500  /* milliamps per lamp */
+#endif
+
+/* Current firmware version reported in OTA version checks */
+#ifndef CONFIG_FIRMWARE_VERSION
+#define CONFIG_FIRMWARE_VERSION "1.0.0"
 #endif
 
 /* Fleet provisioning MQTT topics */
@@ -229,6 +248,20 @@ static fault_state_t s_fault[32];
  * power-fail */
 static uint64_t s_last_fault_check_us = 0;
 
+/* Clock-aligned 15-min telemetry: last IST slot published (0–95, -1=never) */
+static int  s_last_published_slot = -1;
+
+/* Initial publish: deferred until modbus has stabilised after boot */
+static bool s_initial_publish_due  = false;
+
+/* GPS lock transition: triggers one immediate telemetry upload */
+static bool s_gps_was_locked       = false;
+
+/* OTA pending state — set by MQTT handler, consumed by main loop task spawn */
+static char          s_ota_job_id[64]  = {0};
+static char          s_ota_url[512]    = {0};
+static volatile bool s_ota_pending     = false;
+
 /* Wi-Fi */
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
@@ -359,6 +392,203 @@ static void cjson_add_number_2dp(cJSON *obj, const char *name, double value) {
   char buf[32];
   snprintf(buf, sizeof(buf), "%.2f", round_2dp(value));
   cJSON_AddItemToObject(obj, name, cJSON_CreateRaw(buf));
+}
+
+/* ========================================================================== */
+/* Clock-aligned 15-min telemetry                                             */
+/* ========================================================================== */
+/*
+ * get_ist_15min_slot()
+ * Returns the current IST 15-minute slot index (0–95).
+ *   slot 0  = 00:00–00:14 IST
+ *   slot 57 = 14:15–14:29 IST
+ *   slot 95 = 23:45–23:59 IST
+ * Returns -1 if wall-clock time has not yet been synced (year < 2020).
+ */
+static int get_ist_15min_slot(void) {
+  time_t t = time(NULL);
+  if (t < 1577836800LL) return -1; /* pre-2020 → time not synced */
+  struct tm tm;
+  gmtime_r(&t, &tm);
+  int ist_min = (tm.tm_hour * 60 + tm.tm_min + 330) % 1440; /* UTC+5:30 */
+  return ist_min / 15;                                       /* 0–95 */
+}
+
+/*
+ * telemetry_due()
+ * Returns true when a 15-minute telemetry publish should fire:
+ *   • GPS time synced: fires once per IST 15-min boundary (:00/:15/:30/:45)
+ *   • Time not synced: falls back to 15-min elapsed-time interval from boot
+ */
+static bool telemetry_due(void) {
+  int slot = get_ist_15min_slot();
+  if (slot < 0) {
+    /* No time sync — elapsed-time fallback */
+    uint64_t now = esp_timer_get_time();
+    return (s_last_telemetry_us == 0 ||
+            (now - s_last_telemetry_us) >= (TELEMETRY_INTERVAL_MS * 1000ULL));
+  }
+  return (slot != s_last_published_slot);
+}
+
+/* ========================================================================== */
+/* OTA — AWS IoT Jobs firmware update                                         */
+/* ========================================================================== */
+
+/* Publish a job status update to $aws/things/{IMEI}/jobs/{jobId}/update */
+static void ota_report_status(const char *job_id, const char *status,
+                              const char *step_id, const char *fail_code) {
+  if (!s_device_mqtt_client || !s_device_mqtt_connected || !job_id || !job_id[0])
+    return;
+  char topic[160];
+  snprintf(topic, sizeof(topic), "$aws/things/%s/jobs/%s/update", s_imei,
+           job_id);
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "status", status);
+  if (step_id || fail_code) {
+    cJSON *det = cJSON_CreateObject();
+    if (step_id)   cJSON_AddStringToObject(det, "stepId",      step_id);
+    if (fail_code) cJSON_AddStringToObject(det, "failureCode", fail_code);
+    cJSON_AddItemToObject(root, "statusDetails", det);
+  }
+  char *p = cJSON_PrintUnformatted(root);
+  if (p) {
+    esp_mqtt_client_publish(s_device_mqtt_client, topic, p, 0, 1, 0);
+    free(p);
+  }
+  cJSON_Delete(root);
+}
+
+/* FreeRTOS task: download + flash firmware, then reboot.
+ * Runs independently so the MQTT keepalive is not blocked. */
+static void ota_flash_task(void *arg) {
+  (void)arg;
+  char job_id[64], url[512];
+  /* Copy from globals under simple snapshot — main loop sets s_ota_pending=false
+   * before spawning this task so no race with another trigger. */
+  safe_copy(job_id, sizeof(job_id), s_ota_job_id);
+  safe_copy(url,    sizeof(url),    s_ota_url);
+
+  ESP_LOGI(TAG, "OTA: downloading from %s (job=%s)", url, job_id);
+  ota_report_status(job_id, "IN_PROGRESS", "DOWNLOADING", NULL);
+
+  esp_http_client_config_t http_cfg = {
+      .url               = url,
+      .crt_bundle_attach = esp_crt_bundle_attach,
+      .timeout_ms        = 30000,
+  };
+  esp_https_ota_config_t ota_cfg = { .http_config = &http_cfg };
+
+  ota_report_status(job_id, "IN_PROGRESS", "FLASHING", NULL);
+  esp_err_t err = esp_https_ota(&ota_cfg);
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "OTA: flash succeeded — rebooting");
+    ota_report_status(job_id, "SUCCEEDED", NULL, NULL);
+    vTaskDelay(pdMS_TO_TICKS(2000)); /* allow MQTT publish to drain */
+    esp_restart();
+  } else {
+    ESP_LOGE(TAG, "OTA: flash failed (0x%x)", err);
+    const char *code = (err == ESP_ERR_NO_MEM)        ? "INSUFFICIENT_SPACE"
+                     : (err == ESP_ERR_INVALID_ARG)   ? "DOWNLOAD_FAILED"
+                                                      : "FLASH_FAILED";
+    ota_report_status(job_id, "FAILED", NULL, code);
+  }
+  vTaskDelete(NULL);
+}
+
+/* Handle an incoming job notification: request the full job document.
+ * Called for both jobs/notify and jobs/get/accepted payloads. */
+static void ota_request_job_document(const char *job_id) {
+  if (!job_id || !job_id[0]) return;
+  char topic[160];
+  snprintf(topic, sizeof(topic), "$aws/things/%s/jobs/%s/get", s_imei, job_id);
+  char pay[64];
+  snprintf(pay, sizeof(pay), "{\"clientToken\":\"%s\"}", s_imei);
+  if (s_device_mqtt_client && s_device_mqtt_connected)
+    esp_mqtt_client_publish(s_device_mqtt_client, topic, pay, 0, 1, 0);
+}
+
+/* Parse a jobs/notify payload and kick off job document fetch */
+static void ota_handle_notify(const char *json) {
+  cJSON *root = cJSON_Parse(json);
+  if (!root) return;
+  /* jobs.QUEUED[0].jobId */
+  cJSON *jobs  = cJSON_GetObjectItem(root, "jobs");
+  cJSON *queued = jobs ? cJSON_GetObjectItem(jobs, "QUEUED") : NULL;
+  if (!queued) queued = jobs ? cJSON_GetObjectItem(jobs, "IN_PROGRESS") : NULL;
+  cJSON *first = (cJSON_IsArray(queued) && cJSON_GetArraySize(queued) > 0)
+                     ? cJSON_GetArrayItem(queued, 0) : NULL;
+  cJSON *jid   = first ? cJSON_GetObjectItem(first, "jobId") : NULL;
+  if (cJSON_IsString(jid)) {
+    ESP_LOGI(TAG, "OTA: job queued — %s", jid->valuestring);
+    ota_request_job_document(jid->valuestring);
+  }
+  cJSON_Delete(root);
+}
+
+/* Parse a jobs/get/accepted payload (global pending jobs list) */
+static void ota_handle_get_accepted(const char *json) {
+  cJSON *root = cJSON_Parse(json);
+  if (!root) return;
+  /* Try queuedJobs first, then inProgressJobs */
+  cJSON *arr = cJSON_GetObjectItem(root, "queuedJobs");
+  if (!cJSON_IsArray(arr) || cJSON_GetArraySize(arr) == 0)
+    arr = cJSON_GetObjectItem(root, "inProgressJobs");
+  cJSON *first = (cJSON_IsArray(arr) && cJSON_GetArraySize(arr) > 0)
+                     ? cJSON_GetArrayItem(arr, 0) : NULL;
+  cJSON *jid   = first ? cJSON_GetObjectItem(first, "jobId") : NULL;
+  if (cJSON_IsString(jid)) {
+    ESP_LOGI(TAG, "OTA: pending job found — %s", jid->valuestring);
+    ota_request_job_document(jid->valuestring);
+  }
+  cJSON_Delete(root);
+}
+
+/* Parse a jobs/{jobId}/get/accepted payload and set s_ota_pending */
+static void ota_handle_job_document(const char *json) {
+  cJSON *root = cJSON_Parse(json);
+  if (!root) return;
+  cJSON *exec    = cJSON_GetObjectItem(root, "execution");
+  cJSON *jid     = exec ? cJSON_GetObjectItem(exec, "jobId")       : NULL;
+  cJSON *jdoc    = exec ? cJSON_GetObjectItem(exec, "jobDocument") : NULL;
+  cJSON *op      = jdoc ? cJSON_GetObjectItem(jdoc, "operation")   : NULL;
+  cJSON *url     = jdoc ? cJSON_GetObjectItem(jdoc, "url")         : NULL;
+  cJSON *version = jdoc ? cJSON_GetObjectItem(jdoc, "version")     : NULL;
+
+  if (!cJSON_IsString(jid) || !cJSON_IsString(url)) {
+    ESP_LOGW(TAG, "OTA: job document missing jobId or url");
+    cJSON_Delete(root);
+    return;
+  }
+  if (cJSON_IsString(op) && strcmp(op->valuestring, "firmware_update") != 0) {
+    ESP_LOGI(TAG, "OTA: operation '%s' — not a firmware update, skip",
+             op->valuestring);
+    cJSON_Delete(root);
+    return;
+  }
+  /* Version check: skip if already on this version */
+  if (cJSON_IsString(version) &&
+      strcmp(version->valuestring, CONFIG_FIRMWARE_VERSION) == 0) {
+    ESP_LOGI(TAG, "OTA: already on version %s, reporting SUCCEEDED",
+             version->valuestring);
+    ota_report_status(jid->valuestring, "SUCCEEDED", NULL, NULL);
+    cJSON_Delete(root);
+    return;
+  }
+
+  safe_copy(s_ota_job_id, sizeof(s_ota_job_id), jid->valuestring);
+  safe_copy(s_ota_url,    sizeof(s_ota_url),    url->valuestring);
+  s_ota_pending = true;
+  ESP_LOGI(TAG, "OTA: pending — job=%s url=%s ver=%s", s_ota_job_id, s_ota_url,
+           cJSON_IsString(version) ? version->valuestring : "?");
+  cJSON_Delete(root);
+}
+
+/* Returns true if 'topic' matches the pattern prefix+"/"+suffix
+ * (simple single-level wildcard substitution for jobs/{jobId}/... matching) */
+static bool topic_has_suffix(const char *topic, const char *suffix) {
+  size_t tlen = strlen(topic), slen = strlen(suffix);
+  return (tlen >= slen && strcmp(topic + tlen - slen, suffix) == 0);
 }
 
 /* ========================================================================== */
@@ -1325,20 +1555,40 @@ static void publish_telemetry_now(void) {
   format_hhmm(s_sunrise_min, sr, sizeof(sr));
   format_hhmm(s_sunset_min, ss_s, sizeof(ss_s));
 
+  /* Compute fault_code = count of currently active faults */
+  int fault_code_val = 0;
+  for (int _fi = 0; _fi < FIDX_MAX; _fi++) {
+    if (s_fault[_fi].active) fault_code_val++;
+  }
+
+  /* Estimate lights ON from total current / per-lamp rated current */
+  int no_lights_on_val = 0;
+#if CONFIG_CCMS_LAMP_CURRENT_MA > 0
+  {
+    float lamp_a = CONFIG_CCMS_LAMP_CURRENT_MA / 1000.0f;
+    no_lights_on_val = (int)roundf(avg_i / lamp_a);
+    if (no_lights_on_val < 0) no_lights_on_val = 0;
+  }
+#endif
+
+  char nsl_str[16], nwsl_str[16];
+  snprintf(nsl_str,  sizeof(nsl_str),  "%d", (int)CONFIG_CCMS_NSL);
+  snprintf(nwsl_str, sizeof(nwsl_str), "%d", (int)CONFIG_CCMS_NWSL);
+
   cJSON *root = cJSON_CreateObject();
   cJSON_AddStringToObject(root, "device_id", s_imei);
   cJSON_AddStringToObject(root, "time", ts);
   cJSON_AddBoolToObject(root, "on_off", s_relay_on);
-  cJSON_AddNumberToObject(root, "fault_code", 0);
+  cJSON_AddNumberToObject(root, "fault_code", fault_code_val);
   cJSON_AddNumberToObject(root, "latt", s_gps.loc_valid ? s_gps.lat : 0.0);
   cJSON_AddNumberToObject(root, "long", s_gps.loc_valid ? s_gps.lon : 0.0);
   cJSON_AddStringToObject(root, "box_no", "");
-  cJSON_AddStringToObject(root, "nsl", "0");
-  cJSON_AddStringToObject(root, "nwsl", "0");
+  cJSON_AddStringToObject(root, "nsl", nsl_str);
+  cJSON_AddStringToObject(root, "nwsl", nwsl_str);
   cJSON_AddStringToObject(root, "mode", "Auto(A)");
   cJSON_AddStringToObject(root, "sun_set_time", ss_s);
   cJSON_AddStringToObject(root, "sun_rise_time", sr);
-  cJSON_AddNumberToObject(root, "no_lights_on", 0);
+  cJSON_AddNumberToObject(root, "no_lights_on", no_lights_on_val);
 
   /* Overall */
   cjson_add_number_2dp(root, "voltage_v", avg_v);
@@ -1386,11 +1636,18 @@ static void publish_telemetry_now(void) {
         esp_mqtt_client_publish(s_device_mqtt_client, topic, payload, 0, 1, 0);
     ESP_LOGI(TAG,
              "Telemetry published mid=%d | V=%.2f/%.2f/%.2f I=%.2f/%.2f/%.2f"
-             " kWh=%.2f modbus=%s",
-             mid, rv, yv, bv, ri, yi, bi, kwh, s_modbus_online ? "OK" : "NO");
+             " kWh=%.2f modbus=%s fault_code=%d",
+             mid, rv, yv, bv, ri, yi, bi, kwh, s_modbus_online ? "OK" : "NO",
+             fault_code_val);
     free(payload);
   }
   cJSON_Delete(root);
+
+  /* Update clock-aligned slot tracker so telemetry_due() won't re-fire
+   * within the same 15-min window */
+  int _slot = get_ist_15min_slot();
+  if (_slot >= 0) s_last_published_slot = _slot;
+  s_last_telemetry_us = esp_timer_get_time();
 }
 
 /* ========================================================================== */
@@ -1411,6 +1668,8 @@ static void subscribe_device_topics(esp_mqtt_client_handle_t client) {
   snprintf(t, sizeof(t), "$aws/things/%s/jobs/get/rejected", s_imei);
   esp_mqtt_client_subscribe(client, t, 1);
   snprintf(t, sizeof(t), "$aws/things/%s/jobs/+/get/accepted", s_imei);
+  esp_mqtt_client_subscribe(client, t, 1);
+  snprintf(t, sizeof(t), "$aws/things/%s/jobs/+/get/rejected", s_imei);
   esp_mqtt_client_subscribe(client, t, 1);
   snprintf(t, sizeof(t), "$aws/things/%s/jobs/+/update/accepted", s_imei);
   esp_mqtt_client_subscribe(client, t, 1);
@@ -1435,7 +1694,9 @@ static void mqtt_device_handler(void *arg, esp_event_base_t base, int32_t eid,
     s_device_mqtt_connected = true;
     ESP_LOGI(TAG, "Device MQTT connected");
     subscribe_device_topics(ev->client);
-    publish_telemetry_now();
+    /* Initial publish is deferred to the main loop so it fires only after
+     * modbus has stabilised (5 s warm-up + first successful read). */
+    s_initial_publish_due = true;
     break;
 
   case MQTT_EVENT_DISCONNECTED:
@@ -1484,7 +1745,43 @@ static void mqtt_device_handler(void *arg, esp_event_base_t base, int32_t eid,
         cJSON_Delete(r);
       }
     }
-    /* OTA Jobs handler stub — extend here for full OTA support */
+
+    /* ------------------------------------------------------------------ */
+    /* OTA / AWS IoT Jobs handler                                          */
+    /* ------------------------------------------------------------------ */
+    {
+      char jobs_notify_t[128], jobs_get_acc_t[128];
+      snprintf(jobs_notify_t,  sizeof(jobs_notify_t),
+               "$aws/things/%s/jobs/notify", s_imei);
+      snprintf(jobs_get_acc_t, sizeof(jobs_get_acc_t),
+               "$aws/things/%s/jobs/get/accepted", s_imei);
+
+      /* Static buffers for multi-chunk job payloads (reused per-message) */
+      static char job_json[MAX_MQTT_JSON_LEN];
+      int jlen = ev->data_len < (int)(sizeof(job_json) - 1)
+                     ? ev->data_len : (int)(sizeof(job_json) - 1);
+
+      if (!strcmp(topic, jobs_notify_t)) {
+        /* New or updated job notification */
+        memcpy(job_json, ev->data, jlen); job_json[jlen] = '\0';
+        ota_handle_notify(job_json);
+
+      } else if (!strcmp(topic, jobs_get_acc_t)) {
+        /* Response to our on-connect jobs/get poll */
+        memcpy(job_json, ev->data, jlen); job_json[jlen] = '\0';
+        ota_handle_get_accepted(job_json);
+
+      } else if (topic_has_suffix(topic, "/get/accepted")) {
+        /* Per-job document: $aws/things/{IMEI}/jobs/{jobId}/get/accepted */
+        memcpy(job_json, ev->data, jlen); job_json[jlen] = '\0';
+        ota_handle_job_document(job_json);
+
+      } else if (topic_has_suffix(topic, "/get/rejected") ||
+                 topic_has_suffix(topic, "/update/rejected")) {
+        memcpy(job_json, ev->data, jlen); job_json[jlen] = '\0';
+        ESP_LOGW(TAG, "OTA: job request rejected — %.*s", jlen, job_json);
+      }
+    }
     break;
   }
   default:
@@ -1969,11 +2266,14 @@ void app_main(void) {
     gps_solar_update();
 
     uint64_t now = esp_timer_get_time();
+
+    /* ------------------------------------------------------------------ */
+    /* Modbus detection + power-failure + fault checks                     */
+    /* ------------------------------------------------------------------ */
     if (now >= s_modbus_start_after_us) {
       modbus_detect_if_needed();
       update_power_failure_logic(s_cached_rv, s_cached_yv, s_cached_bv);
-      /* V3-4: Fault logic runs here in the main loop, not in MQTT task.
-       * Uses the same validated cached values as power-fail logic. */
+      /* V3-4: Fault logic runs in main loop, not MQTT task. */
       if ((now - s_last_fault_check_us) >= POWER_CHECK_INTERVAL_US) {
         s_last_fault_check_us = now;
         check_and_publish_faults(s_cached_rv, s_cached_yv, s_cached_bv,
@@ -1981,8 +2281,43 @@ void app_main(void) {
       }
     }
 
-    /* Auto relay: ON at sunset, OFF at sunrise.
-     * Requires GPS fix (s_solar_valid). s_relay_on prevents re-triggering. */
+    /* ------------------------------------------------------------------ */
+    /* REQ 3 — Initial publish after modbus stabilises on boot.            */
+    /* Fires once: when modbus comes online after the 5 s warm-up, or      */
+    /* after a 2-min safety timeout so the server always gets an update.   */
+    /* ------------------------------------------------------------------ */
+    if (s_initial_publish_due && s_device_mqtt_connected &&
+        now >= s_modbus_start_after_us &&
+        (s_modbus_online ||
+         now >= s_modbus_start_after_us + 120000000ULL /* 2 min */)) {
+      ESP_LOGI(TAG, "Initial publish after boot stabilisation");
+      publish_telemetry_now();
+      s_initial_publish_due = false;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* REQ 4 — GPS lock: publish coordinates immediately on first fix.     */
+    /* ------------------------------------------------------------------ */
+    if (s_gps_locked_once && !s_gps_was_locked) {
+      s_gps_was_locked = true;
+      if (s_device_mqtt_connected && !s_initial_publish_due) {
+        ESP_LOGI(TAG, "GPS fix acquired — uploading coordinates");
+        publish_telemetry_now();
+      }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* REQ 2 — Clock-aligned 15-min telemetry (IST :00/:15/:30/:45).       */
+    /* Falls back to 15-min interval if GPS time has not yet synced.       */
+    /* Skipped while initial publish is still pending (avoids duplicate).  */
+    /* ------------------------------------------------------------------ */
+    if (!s_initial_publish_due && s_device_mqtt_connected && telemetry_due()) {
+      publish_telemetry_now();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Auto relay — sunset → ON, sunrise → OFF                            */
+    /* ------------------------------------------------------------------ */
     if (s_solar_valid && s_device_mqtt_connected) {
       bool night = is_night_time();
       if (night && !s_relay_on) {
@@ -1996,11 +2331,16 @@ void app_main(void) {
       }
     }
 
-    if (s_last_telemetry_us == 0 ||
-        (now - s_last_telemetry_us) >= (TELEMETRY_INTERVAL_MS * 1000ULL)) {
-      publish_telemetry_now();
-      s_last_telemetry_us = now;
+    /* ------------------------------------------------------------------ */
+    /* OTA — spawn flash task when job document has been received.         */
+    /* Runs in a separate task so MQTT keepalive is never blocked.         */
+    /* ------------------------------------------------------------------ */
+    if (s_ota_pending) {
+      s_ota_pending = false; /* clear before spawn — prevents re-entry */
+      ESP_LOGI(TAG, "OTA: spawning flash task for job %s", s_ota_job_id);
+      xTaskCreate(ota_flash_task, "ota", 8192, NULL, 5, NULL);
     }
+
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
