@@ -133,6 +133,9 @@
 #include "cJSON.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "esp_http_client.h"
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
 #include "esp_rom_sys.h"  /* esp_rom_delay_us() */
 #include "esp_sntp.h"     /* V9-1: NTP / SNTP time sync */
 #include "mqtt_client.h"
@@ -161,6 +164,10 @@ static SemaphoreHandle_t s_modbus_mutex = NULL;
 /* V6-3: telemetry is grid-aligned; TELEMETRY_INTERVAL_SEC is the grid slot
  * size (15 min) used for computing the next wall-clock boundary. */
 #define TELEMETRY_INTERVAL_SEC (15UL * 60UL) /* 15 minutes in sec */
+
+#ifndef CONFIG_FIRMWARE_VERSION
+#define CONFIG_FIRMWARE_VERSION "1.0"
+#endif
 
 /* V6-2: how often to re-check that the latch relay is still ON
  * while inside the night window (sunset -> sunrise). */
@@ -336,6 +343,11 @@ static int s_sunset_min = -1;
 static bool s_solar_valid = false;
 static char s_gps_line[128] = {0};
 static int s_gps_line_len = 0;
+
+/* OTA state — written by MQTT task, read by main loop to spawn flash task */
+static char          s_ota_job_id[64]  = {0};
+static char          s_ota_url[512]    = {0};
+static volatile bool s_ota_pending     = false;
 
 /* MQTT chunk accumulator */
 typedef struct {
@@ -1282,6 +1294,66 @@ static void update_power_failure_logic(float rv, float yv, float bv) {
 /* ========================================================================== */
 /* Fault publishing                                                           */
 /* ========================================================================== */
+/* OTA — AWS IoT Jobs + esp_https_ota                                        */
+/* ========================================================================== */
+/* Report job status back to AWS IoT Jobs service */
+static void ota_report_status(const char *job_id, const char *status,
+                              const char *step_id, const char *fail_code) {
+  if (!s_device_mqtt_client || !s_device_mqtt_connected) return;
+  char topic[160];
+  snprintf(topic, sizeof(topic), "$aws/things/%s/jobs/%s/update", s_imei, job_id);
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "status", status);
+  if (step_id)   cJSON_AddStringToObject(root, "stepId",        step_id);
+  if (fail_code) cJSON_AddStringToObject(root, "failureCode",   fail_code);
+  cJSON *det = cJSON_AddObjectToObject(root, "statusDetails");
+  cJSON_AddStringToObject(det, "version", CONFIG_FIRMWARE_VERSION);
+  char *p = cJSON_PrintUnformatted(root);
+  if (p) {
+    esp_mqtt_client_publish(s_device_mqtt_client, topic, p, 0, 1, 0);
+    ESP_LOGI(TAG, "OTA job %s → %s", job_id, status);
+    free(p);
+  }
+  cJSON_Delete(root);
+}
+
+/* Runs in its own 8 KB task — downloads and flashes the new firmware */
+static void ota_flash_task(void *arg) {
+  char job_id[64], url[512];
+  /* Snapshot the shared state before any delays */
+  strlcpy(job_id, s_ota_job_id, sizeof(job_id));
+  strlcpy(url,    s_ota_url,    sizeof(url));
+
+  ota_report_status(job_id, "IN_PROGRESS", "DOWNLOADING", NULL);
+  ESP_LOGI(TAG, "OTA: downloading %s", url);
+
+  esp_http_client_config_t http_cfg = {
+    .url              = url,
+    .crt_bundle_attach = esp_crt_bundle_attach,
+    .timeout_ms       = 60000,
+    .keep_alive_enable = true,
+  };
+  esp_https_ota_config_t ota_cfg = { .http_config = &http_cfg };
+
+  ota_report_status(job_id, "IN_PROGRESS", "FLASHING", NULL);
+  esp_err_t err = esp_https_ota(&ota_cfg);
+
+  if (err == ESP_OK) {
+    ota_report_status(job_id, "SUCCEEDED", NULL, NULL);
+    ESP_LOGI(TAG, "OTA succeeded — rebooting in 2 s");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+  } else {
+    const char *code =
+      (err == ESP_ERR_NO_MEM)      ? "INSUFFICIENT_SPACE" :
+      (err == ESP_ERR_INVALID_ARG) ? "DOWNLOAD_FAILED"    : "FLASH_FAILED";
+    ESP_LOGE(TAG, "OTA failed: %s (%d)", code, err);
+    ota_report_status(job_id, "FAILED", NULL, code);
+  }
+  vTaskDelete(NULL);
+}
+
+/* ========================================================================== */
 /* V3-2: Cooldown-aware fault publisher — prevents storm flooding on dashboard
  */
 static void publish_fault(const char *code, bool active) {
@@ -1509,6 +1581,7 @@ static void publish_telemetry_now(void) {
   cJSON_AddStringToObject(root, "sun_set_time", ss_s);
   cJSON_AddStringToObject(root, "sun_rise_time", sr);
   cJSON_AddNumberToObject(root, "no_lights_on", 0);
+  cJSON_AddStringToObject(root, "firmware_version", CONFIG_FIRMWARE_VERSION);
 
   /* Overall — .2f */
   ADD_F2(root, "voltage_v", avg_v);
@@ -1670,7 +1743,71 @@ static void mqtt_device_handler(void *arg, esp_event_base_t base, int32_t eid,
         cJSON_Delete(r);
       }
     }
-    /* OTA Jobs handler stub — extend here for full OTA support */
+    /* ---- AWS IoT Jobs: new job notification ---- */
+    char jobs_notify_t[128];
+    snprintf(jobs_notify_t, sizeof(jobs_notify_t),
+             "$aws/things/%s/jobs/notify", s_imei);
+    if (!strcmp(topic, jobs_notify_t)) {
+      /* A new job arrived — request the full document for each queued job */
+      cJSON *r = cJSON_ParseWithLength(ev->data, ev->data_len);
+      if (r) {
+        cJSON *jobs = cJSON_GetObjectItem(r, "jobs");
+        cJSON *queued = jobs ? cJSON_GetObjectItem(jobs, "QUEUED") : NULL;
+        if (cJSON_IsArray(queued)) {
+          cJSON *entry;
+          cJSON_ArrayForEach(entry, queued) {
+            cJSON *jid = cJSON_GetObjectItem(entry, "jobId");
+            if (cJSON_IsString(jid)) {
+              char get_t[160];
+              snprintf(get_t, sizeof(get_t),
+                       "$aws/things/%s/jobs/%s/get", s_imei, jid->valuestring);
+              esp_mqtt_client_publish(ev->client, get_t, "{}", 2, 1, 0);
+              ESP_LOGI(TAG, "OTA: requested job doc for %s", jid->valuestring);
+            }
+          }
+        }
+        cJSON_Delete(r);
+      }
+      break;
+    }
+
+    /* ---- AWS IoT Jobs: job document received ---- */
+    /* topic pattern: $aws/things/{IMEI}/jobs/{jobId}/get/accepted */
+    char jobs_get_pfx[100];
+    snprintf(jobs_get_pfx, sizeof(jobs_get_pfx),
+             "$aws/things/%s/jobs/", s_imei);
+    if (!strncmp(topic, jobs_get_pfx, strlen(jobs_get_pfx)) &&
+        strstr(topic, "/get/accepted")) {
+      cJSON *r = cJSON_ParseWithLength(ev->data, ev->data_len);
+      if (r) {
+        cJSON *exec = cJSON_GetObjectItem(r, "execution");
+        cJSON *jid  = exec ? cJSON_GetObjectItem(exec, "jobId")       : NULL;
+        cJSON *doc  = exec ? cJSON_GetObjectItem(exec, "jobDocument") : NULL;
+        cJSON *op   = doc  ? cJSON_GetObjectItem(doc,  "operation")   : NULL;
+        cJSON *url  = doc  ? cJSON_GetObjectItem(doc,  "url")         : NULL;
+        cJSON *ver  = doc  ? cJSON_GetObjectItem(doc,  "version")     : NULL;
+
+        if (cJSON_IsString(op)  && !strcmp(op->valuestring,  "OTA") &&
+            cJSON_IsString(jid) && cJSON_IsString(url)) {
+          /* Skip if version matches what is already running */
+          if (cJSON_IsString(ver) &&
+              !strcmp(ver->valuestring, CONFIG_FIRMWARE_VERSION)) {
+            ESP_LOGW(TAG, "OTA: already on v%s — skipping job %s",
+                     CONFIG_FIRMWARE_VERSION, jid->valuestring);
+            ota_report_status(jid->valuestring, "SUCCEEDED", NULL, NULL);
+          } else if (!s_ota_pending) {
+            strlcpy(s_ota_job_id, jid->valuestring, sizeof(s_ota_job_id));
+            strlcpy(s_ota_url,    url->valuestring, sizeof(s_ota_url));
+            s_ota_pending = true;
+            ESP_LOGI(TAG, "OTA: queued job %s url=%s ver=%s",
+                     s_ota_job_id, s_ota_url,
+                     cJSON_IsString(ver) ? ver->valuestring : "?");
+          }
+        }
+        cJSON_Delete(r);
+      }
+      break;
+    }
     break;
   }
   default:
@@ -2345,6 +2482,12 @@ void app_main(void) {
         ESP_LOGI(TAG, "Telemetry done; next grid slot in %lds",
                  (long)(s_next_telemetry_epoch - wall));
       }
+    }
+
+    /* OTA: spawn flash task when MQTT handler has queued a job */
+    if (s_ota_pending) {
+      s_ota_pending = false;
+      xTaskCreate(ota_flash_task, "ota_flash", 8192, NULL, 5, NULL);
     }
 
     vTaskDelay(pdMS_TO_TICKS(1000));
