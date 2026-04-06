@@ -1,0 +1,11 @@
+# Custom partition table — required for OTA + binary > 1 MB
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# Flash size must match your hardware (ESP32 modules typically 4 MB)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Firmware version — update this before each OTA release
+CONFIG_FIRMWARE_VERSION="8.1"
