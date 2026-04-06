@@ -1361,9 +1361,13 @@ static void publish_fault(const char *code, bool active) {
     return;
   char topic[80];
   snprintf(topic, sizeof(topic), "evt/%s/fault", s_imei);
+  char ts[32] = {0};
+  iso_time_utc(ts, sizeof(ts));
   cJSON *root = cJSON_CreateObject();
-  cJSON_AddStringToObject(root, "alarmCode", code);
-  cJSON_AddBoolToObject(root, "active", active);
+  cJSON_AddStringToObject(root, "device_id",  s_imei);
+  cJSON_AddStringToObject(root, "time",        ts);
+  cJSON_AddStringToObject(root, "alarmCode",   code);
+  cJSON_AddBoolToObject(root,   "active",      active);
   char *p = cJSON_PrintUnformatted(root);
   if (p) {
     esp_mqtt_client_publish(s_device_mqtt_client, topic, p, 0, 1, 0);
