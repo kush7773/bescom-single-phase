@@ -888,6 +888,7 @@ static void modbus_detect_if_needed(void) {
 /* V6-1: forward declarations — definitions appear after GPS/NVS helpers */
 static void nvs_save_relay_state(bool on);
 static bool nvs_load_relay_state(void);
+static void iso_time_utc(char *out, size_t sz);
 static void relay_on(void) {
   gpio_set_level(RELAY_RESET_PIN, 1); /* RESET stays HIGH (idle) */
   gpio_set_level(RELAY_SET_PIN, 0);   /* SET pulse LOW -> latches ON */
@@ -1192,7 +1193,7 @@ static void nvs_save_relay_state(bool on) {
   nvs_close(h);
 }
 
-static bool nvs_load_relay_state(void) {
+static bool __attribute__((unused)) nvs_load_relay_state(void) {
   nvs_handle_t h;
   if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK)
     return false;
