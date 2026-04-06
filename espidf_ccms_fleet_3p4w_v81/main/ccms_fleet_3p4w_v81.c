@@ -1574,7 +1574,7 @@ static void publish_telemetry_now(void) {
   cJSON_AddBoolToObject(root, "on_off", s_relay_on);
   int fault_code_val = 0;
   for (int _fi = 0; _fi < FIDX_MAX; _fi++) {
-    if (s_fault[_fi].active) fault_code_val++;
+    if (s_fault[_fi].active) fault_code_val |= (1 << _fi);
   }
   cJSON_AddNumberToObject(root, "fault_code", fault_code_val);
   cJSON_AddNumberToObject(root, "latt", s_gps.loc_valid ? s_gps.lat : 0.0);
