@@ -1563,6 +1563,19 @@ static void publish_telemetry_now(void) {
     free(payload);
   }
   cJSON_Delete(root);
+
+  /* Persist current time to NVS so next reboot skips NTP wait */
+  {
+    time_t _t = time(NULL);
+    if (_t > 1700000000UL) {
+      nvs_handle_t _th;
+      if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &_th) == ESP_OK) {
+        nvs_set_i64(_th, "last_time", (int64_t)_t);
+        nvs_commit(_th);
+        nvs_close(_th);
+      }
+    }
+  }
 }
 
 /* ========================================================================== */
@@ -1992,6 +2005,21 @@ static void ccms_hw_init(void) {
   ESP_ERROR_CHECK(uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN,
                                UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
   ESP_ERROR_CHECK(uart_driver_install(GPS_UART_NUM, 1024, 0, 0, NULL, 0));
+
+  /* Restore last saved Unix time so clock_is_valid() is true on first boot
+   * iteration — relay fires immediately without waiting for NTP/GPS. */
+  {
+    nvs_handle_t _th;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &_th) == ESP_OK) {
+      int64_t _t = 0;
+      if (nvs_get_i64(_th, "last_time", &_t) == ESP_OK && _t > 1700000000LL) {
+        struct timeval _tv = {.tv_sec = (time_t)_t};
+        settimeofday(&_tv, NULL);
+        ESP_LOGI(TAG, "Clock restored from NVS: %lld", (long long)_t);
+      }
+      nvs_close(_th);
+    }
+  }
 
   solar_load_from_nvs();
 
