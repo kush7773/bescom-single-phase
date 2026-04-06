@@ -1,0 +1,11 @@
+# CCMS ESP32 — Custom partition table with OTA support
+# Flash size: 4 MB (0x400000)
+#
+# Binary size as of v8.1: ~0x1099a0 (1.03 MB).
+# Each OTA slot is 0x1C0000 (1.75 MB) — leaves ~450 KB headroom for growth.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+ota_0,      app,  ota_0,    0x10000,  0x1C0000,
+ota_1,      app,  ota_1,    0x1D0000, 0x1C0000,
